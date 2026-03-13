@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""프로젝트 보고서를 Notion DB에 동기화하는 스크립트.
+
+변경된 보고서 파일의 frontmatter를 파싱하여 Notion DB에 생성/업데이트합니다.
+
+Usage:
+    python scripts/sync_notion.py reports/.../report-01.md [...]
+
+Environment:
+    NOTION_API_KEY          - Notion Internal Integration Token
+    NOTION_PROJECT_DB_ID    - 대상 Notion ProjectDB ID
+    GITHUB_REPOSITORY       - GitHub 레포 (owner/repo 형식, Actions에서 자동 설정)
+    GITHUB_SERVER_URL       - GitHub 서버 URL (Actions에서 자동 설정)
+"""
+
+import os
+import re
+import sys
+from pathlib import Path
+
+import frontmatter
+from notion_client import Client
+
+
+def get_notion_client() -> Client:
+    api_key = os.environ.get("NOTION_API_KEY")
+    if not api_key:
+        print("Error: NOTION_API_KEY 환경변수가 설정되지 않았습니다.")
+        sys.exit(1)
+    return Client(auth=api_key)
+
+
+def get_database_id() -> str:
+    db_id = os.environ.get("NOTION_PROJECT_DB_ID")
+    if not db_id:
+        print("Error: NOTION_PROJECT_DB_ID 환경변수가 설정되지 않았습니다.")
+        sys.exit(1)
+    return db_id
+
+
+def build_github_url(filepath: Path) -> str:
+    """보고서 파일의 GitHub URL을 생성합니다."""
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if not repo:
+        return ""
+    return f"{server}/{repo}/blob/main/{filepath}"
+
+
+def parse_report(filepath: Path) -> tuple[dict, str]:
+    """보고서 파일의 frontmatter와 본문을 파싱합니다."""
+    post = frontmatter.load(filepath)
+    return post.metadata, post.content
+
+
+def rich_text(content: str) -> list[dict]:
+    """Notion rich_text 객체를 생성합니다."""
+    if len(content) > 2000:
+        content = content[:2000]
+    return [{"type": "text", "text": {"content": content}}]
+
+
+def format_contributions(contributions: list[dict]) -> str:
+    """contributions 목록을 읽기 쉬운 문자열로 변환합니다."""
+    parts = []
+    for c in contributions:
+        name = c.get("name", "")
+        role = c.get("role", "")
+        tasks = c.get("tasks", "")
+        pct = c.get("percentage", 0)
+        parts.append(f"{name}({role}): {tasks} - {pct}%")
+    return "\n".join(parts)
+
+
+def markdown_to_notion_blocks(md: str) -> list[dict]:
+    """마크다운 텍스트를 Notion 블록 리스트로 변환합니다."""
+    blocks = []
+    lines = md.split("\n")
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+
+        # 빈 줄 건너뛰기
+        if not line.strip():
+            i += 1
+            continue
+
+        # 코드 블록
+        if line.strip().startswith("```"):
+            lang = line.strip().removeprefix("```").strip()
+            code_lines = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                code_lines.append(lines[i])
+                i += 1
+            i += 1  # 닫는 ``` 건너뛰기
+            code_content = "\n".join(code_lines)
+            if len(code_content) > 2000:
+                code_content = code_content[:2000]
+            blocks.append({
+                "object": "block",
+                "type": "code",
+                "code": {
+                    "rich_text": rich_text(code_content),
+                    "language": lang if lang else "plain text",
+                },
+            })
+            continue
+
+        # 제목
+        if line.startswith("### "):
+            blocks.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": rich_text(line[4:].strip())},
+            })
+            i += 1
+            continue
+
+        if line.startswith("## "):
+            blocks.append({
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {"rich_text": rich_text(line[3:].strip())},
+            })
+            i += 1
+            continue
+
+        if line.startswith("# "):
+            blocks.append({
+                "object": "block",
+                "type": "heading_1",
+                "heading_1": {"rich_text": rich_text(line[2:].strip())},
+            })
+            i += 1
+            continue
+
+        # 인용문
+        if line.startswith("> "):
+            quote_lines = []
+            while i < len(lines) and lines[i].startswith("> "):
+                quote_lines.append(lines[i][2:])
+                i += 1
+            blocks.append({
+                "object": "block",
+                "type": "quote",
+                "quote": {"rich_text": rich_text("\n".join(quote_lines))},
+            })
+            continue
+
+        # 비순서 목록
+        if re.match(r"^[-*] ", line):
+            while i < len(lines) and re.match(r"^[-*] ", lines[i]):
+                blocks.append({
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {"rich_text": rich_text(lines[i][2:].strip())},
+                })
+                i += 1
+            continue
+
+        # 순서 목록
+        if re.match(r"^\d+\. ", line):
+            while i < len(lines) and re.match(r"^\d+\. ", lines[i]):
+                text = re.sub(r"^\d+\. ", "", lines[i]).strip()
+                blocks.append({
+                    "object": "block",
+                    "type": "numbered_list_item",
+                    "numbered_list_item": {"rich_text": rich_text(text)},
+                })
+                i += 1
+            continue
+
+        # 이미지
+        img_match = re.match(r"!\[([^\]]*)\]\(([^)]+)\)", line.strip())
+        if img_match:
+            url = img_match.group(2)
+            if url.startswith("http"):
+                blocks.append({
+                    "object": "block",
+                    "type": "image",
+                    "image": {"type": "external", "external": {"url": url}},
+                })
+            i += 1
+            continue
+
+        # 구분선
+        if re.match(r"^(-{3,}|\*{3,}|_{3,})$", line.strip()):
+            blocks.append({"object": "block", "type": "divider", "divider": {}})
+            i += 1
+            continue
+
+        # 일반 텍스트 (연속된 줄을 하나의 paragraph로)
+        para_lines = []
+        while i < len(lines) and lines[i].strip() and not any([
+            lines[i].startswith("#"),
+            lines[i].startswith("> "),
+            lines[i].startswith("```"),
+            re.match(r"^[-*] ", lines[i]),
+            re.match(r"^\d+\. ", lines[i]),
+            re.match(r"^(-{3,}|\*{3,}|_{3,})$", lines[i].strip()),
+            re.match(r"!\[([^\]]*)\]\(([^)]+)\)", lines[i].strip()),
+        ]):
+            para_lines.append(lines[i])
+            i += 1
+        blocks.append({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": rich_text("\n".join(para_lines))},
+        })
+
+    # Notion API는 한 번에 최대 100개 블록
+    return blocks[:100]
+
+
+def find_existing_page(
+    notion: Client, database_id: str,
+    project_name: str, quad_name: str, report_number: int,
+) -> str | None:
+    """프로젝트명+쿼드조+회차로 기존 Notion 페이지를 검색합니다. 있으면 page_id 반환."""
+    response = notion.databases.query(
+        database_id=database_id,
+        filter={
+            "and": [
+                {
+                    "property": "프로젝트명",
+                    "title": {"equals": project_name},
+                },
+                {
+                    "property": "쿼드 조",
+                    "select": {"equals": quad_name},
+                },
+                {
+                    "property": "보고 회차",
+                    "number": {"equals": report_number},
+                },
+            ]
+        },
+    )
+    results = response.get("results", [])
+    if results:
+        return results[0]["id"]
+    return None
+
+
+def build_properties(metadata: dict, github_url: str) -> dict:
+    """frontmatter 메타데이터를 Notion properties로 변환합니다."""
+    properties = {
+        "프로젝트명": {"title": [{"text": {"content": metadata.get("project_name", "")}}]},
+        "쿼드 조": {"select": {"name": metadata.get("quad_name", "")}},
+        "조원": {"rich_text": rich_text(", ".join(metadata.get("members", [])))},
+        "보고 회차": {"number": metadata.get("report_number", 1)},
+        "진행 상태": {"status": {"name": metadata.get("status", "진행 중")}},
+        "CL 등급": {"select": {"name": metadata.get("cl_level", "CL1")}},
+    }
+
+    # 제출일
+    date = metadata.get("date")
+    if date:
+        properties["제출일"] = {"date": {"start": str(date)}}
+
+    # 최종 보고서 여부
+    is_final = metadata.get("is_final", False)
+    properties["최종 보고서"] = {"checkbox": bool(is_final)}
+
+    # 기여도
+    contributions = metadata.get("contributions")
+    if contributions and isinstance(contributions, list):
+        contrib_text = format_contributions(contributions)
+        properties["기여도"] = {"rich_text": rich_text(contrib_text)}
+
+    # Git 링크
+    if github_url:
+        properties["Git 링크"] = {"url": github_url}
+
+    return properties
+
+
+def clear_page_content(notion: Client, page_id: str) -> None:
+    """기존 페이지의 블록을 모두 삭제합니다."""
+    children = notion.blocks.children.list(block_id=page_id)
+    for block in children.get("results", []):
+        notion.blocks.delete(block_id=block["id"])
+
+
+def sync_report(notion: Client, database_id: str, filepath: Path) -> None:
+    """단일 보고서를 Notion DB에 동기화합니다."""
+    metadata, content = parse_report(filepath)
+    project_name = metadata.get("project_name", "")
+    quad_name = metadata.get("quad_name", "")
+    report_number = metadata.get("report_number", 0)
+
+    if not project_name or not quad_name:
+        print(f"[SKIP] {filepath}: project_name 또는 quad_name 누락")
+        return
+
+    github_url = build_github_url(filepath)
+    properties = build_properties(metadata, github_url)
+    blocks = markdown_to_notion_blocks(content)
+
+    existing_page_id = find_existing_page(
+        notion, database_id, project_name, quad_name, report_number,
+    )
+
+    if existing_page_id:
+        notion.pages.update(page_id=existing_page_id, properties=properties)
+        clear_page_content(notion, existing_page_id)
+        if blocks:
+            notion.blocks.children.append(block_id=existing_page_id, children=blocks)
+        print(f"[UPDATE] {quad_name} - {project_name} (회차 {report_number})")
+    else:
+        notion.pages.create(
+            parent={"database_id": database_id},
+            properties=properties,
+            children=blocks,
+        )
+        print(f"[CREATE] {quad_name} - {project_name} (회차 {report_number})")
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("Usage: python sync_notion.py <report_file> [...]")
+        return 1
+
+    notion = get_notion_client()
+    database_id = get_database_id()
+
+    for filepath_str in sys.argv[1:]:
+        filepath = Path(filepath_str)
+        if not filepath.exists():
+            print(f"[SKIP] {filepath}: 파일 없음")
+            continue
+        try:
+            sync_report(notion, database_id, filepath)
+        except Exception as e:
+            print(f"[ERROR] {filepath}: {e}")
+            return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
